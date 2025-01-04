@@ -1,7 +1,8 @@
 <?php
 
 /**
- * Функция для отловли и исправления JsData в оформлении заказа, что бы наш input в sale.order.ajax работал
+ * Функция для отловли и исправления JsData в оформлении заказа, чтобы input в sale.order.ajax работал.
+ * При авторизованном пользователе она вычисляет возможную сумму для списания с аккаунта.
  */
 \Bitrix\Main\EventManager::getInstance()->addEventHandler(
     'sale',
@@ -12,20 +13,26 @@
 function OnSaleComponentOrderJsDataHandler(&$arResult, &$arParams)
 {
     global $USER;
+    // Проверяем, авторизован ли пользователь
     if ($USER->IsAuthorized()) {
         $USER_ID = $USER->GetID();
-        $dbUserAccount = CSaleUserAccount::GetList([], ["USER_ID" => $USER_ID, "CURRENCY" => "RUB",]);
+        // Получаем данные о балансе пользователя
+        $dbUserAccount = CSaleUserAccount::GetList([], ["USER_ID" => $USER_ID, "CURRENCY" => "RUB"]);
         $_SESSION['USER_ACCOUNT'] = $dbUserAccount->Fetch();
         $budget = floatval($_SESSION['USER_ACCOUNT']['CURRENT_BUDGET']);
+
+        // Если баланс положительный
         if ($budget > 0) {
+            // Получаем информацию о пользователе
             $rsUser = CUser::GetByID($USER_ID);
             $arUser = $rsUser->Fetch();
             $_SESSION['USER_STATUS'] = $arUser['UF_STATUS'];
-            $status = get_status(
-                $_SESSION['USER_STATUS']
-            );//Функция отвечающая за то, сколько процентов от заказа может испльзовать Юзер
+            // Получаем статус пользователя, чтобы узнать, сколько процентов он может потратить
+            $status = get_status($_SESSION['USER_STATUS']);
             $status['UF_PERSENT'] = $status['UF_PERSENT'] ? $status['UF_PERSENT'] : 15;
             $proc_commision = intval($status['UF_PERSENT']) / 100;
+
+            // Инициализируем нужные данные
             $arResult['JS_DATA']['TOTAL']["WANT_SPEND"] = 0;
             foreach ($arResult['JS_DATA']['ORDER_PROP']['properties'] as $props) {
                 if ($props['CODE'] == 'WANT_SPEND') {
@@ -33,19 +40,25 @@ function OnSaleComponentOrderJsDataHandler(&$arResult, &$arParams)
                     $arResult['JS_DATA']['TOTAL']["WANT_SPEND"] = intval($props['VALUE'][0]);
                 }
             }
+
             $orderPrice = $arResult['JS_DATA']['TOTAL']['ORDER_PRICE'];
+            // Вычисляем возможную комиссию, которую может списать пользователь
             $comision = intval($orderPrice * $proc_commision);
+            // Ограничиваем комиссию оставшимся балансом
             if ($comision > $budget) {
                 $comision = $budget;
             }
+
             $want_spend = $arResult['JS_DATA']['TOTAL']["WANT_SPEND"];
             $arResult['JS_DATA']['TOTAL']['COMISION'] = $comision;
 
-
+            // Ограничиваем сумму, которую хочет потратить пользователь, комиссией
             if ($want_spend > $comision) {
                 $want_spend = $comision;
                 $arResult['JS_DATA']['TOTAL']["WANT_SPEND"] = $comision;
             }
+
+            // Заполняем оставшиеся данные
             $arResult['JS_DATA']['OLD'] = $status;
             $arResult['JS_DATA']['CURRENT_BUDGET'] = intval($budget);
             $arResult['JS_DATA']['CURRENT_BUDGET_FORMATED'] = $arResult['JS_DATA']['CURRENT_BUDGET'] . " &#8381;";
@@ -57,27 +70,28 @@ function OnSaleComponentOrderJsDataHandler(&$arResult, &$arParams)
 }
 
 /**
- * Функция для ловли создания заказа и создание оплаченной "платежки" в формате "внутренний счет", с дополнительной
- * проверкой по ограничениям оплаты
- * Оставшуюся стоимость "размазывает" по всем товарам. Это требуется некоторомы экварингами)
- * Так же есть транзакция для Битрикс, что бы отслеживать в модуле Внутреннего счета внутри Битрикс
+ * Функция для ловли создания заказа и создание оплаченной "платежки" в формате "внутренний счет".
+ * Проверка по ограничениям оплаты. Остаток суммы распределяется по товарам.
  */
 \Bitrix\Main\EventManager::getInstance()->addEventHandler(
     'sale',
     'OnSaleOrderBeforeSaved',
     'OnSaleOrderBeforeSavedFunction'
 );
+
 function OnSaleOrderBeforeSavedWantSpend(\Bitrix\Main\Event $event)
 {
     global $USER;
     $userId = $USER->GetID();
     $budget = floatval($_SESSION['USER_ACCOUNT']['CURRENT_BUDGET']);
+
     if ($budget) {
-        /** @var \Bitrix\Sale\Order $order * */
+        /** @var \Bitrix\Sale\Order $order */
         $order = $event->getParameter("ENTITY");
         if ($order->getId()) {
             return;
         }
+
         $oldValues = $event->getParameter("VALUES");
         $paymentCollection = $order->getPaymentCollection();
         $orderBasket = $order->getBasket();
@@ -91,6 +105,8 @@ function OnSaleOrderBeforeSavedWantSpend(\Bitrix\Main\Event $event)
         $want_send_property = false;
         $want_spend = 0;
         $EMAIL = '';
+
+        // Обрабатываем свойства заказа
         foreach ($arPropertyCollection['properties'] as $props) {
             if ($props['CODE'] == 'WANT_SPEND') {
                 $want_send_property = $propertyCollection->getItemByOrderPropertyId($props['ID']);
@@ -100,6 +116,8 @@ function OnSaleOrderBeforeSavedWantSpend(\Bitrix\Main\Event $event)
                 $TransactIdProperty = $propertyCollection->getItemByOrderPropertyId($props['ID']);
             }
         }
+
+        // Проверяем, можно ли списать деньги с внутреннего счета
         if ($want_spend) {
             if ($commission > $budget) {
                 $commission = $budget;
@@ -109,6 +127,8 @@ function OnSaleOrderBeforeSavedWantSpend(\Bitrix\Main\Event $event)
                 $want_send_property->setValue($commission);
             }
         }
+
+        // Если нет внутренней оплаты, создаем транзакцию
         if (!$paymentCollection->isExistsInnerPayment()) {
             if ($want_spend) {
                 $resultTransact = CSaleUserTransact::Add(
@@ -121,10 +141,14 @@ function OnSaleOrderBeforeSavedWantSpend(\Bitrix\Main\Event $event)
                         "TRANSACT_DATE" => ConvertTimeStamp(time(), "FULL"),
                     ]
                 );
+
                 if (is_int($resultTransact)) {
+                    // Устанавливаем идентификатор транзакции в свойства заказа
                     if ($TransactIdProperty) {
                         $TransactIdProperty->setValue($resultTransact);
                     }
+
+                    // Обрабатываем платежи, удаляя старые и добавляя новые
                     foreach ($paymentCollection as $payment) {
                         $service = \Bitrix\Sale\PaySystem\Manager::getObjectById($payment->getPaymentSystemId());
                         $r = $payment->delete();
@@ -134,9 +158,13 @@ function OnSaleOrderBeforeSavedWantSpend(\Bitrix\Main\Event $event)
                         $newMainPayment = $paymentCollection->createItem($service);
                         $newMainPayment->setField('SUM', ($orderPrice - $want_spend));
                     }
+
+                    // Создаем новый внутренний платеж
                     $newPayment = $paymentCollection->createInnerPayment();
                     $newPayment->setField('SUM', 0);
-                    $newPayment->setPaid("N");//По идее, можно было отслеживать по $resultTransact и наличию данных в $TransactIdProperty, но код писался не с нуля, поэтому оставил проверку на наличие внутренней оплаты, а тут она 0 и N, по причине, что часть эквайрингов очень ревностно относятся к оплатам и не пускают такие в оплату вообще
+                    $newPayment->setPaid("N");
+
+                    // Перераспределяем остаток на товары в заказе
                     $basket_want_spend = $want_spend;
                     foreach ($orderBasket as $key => $basketItem) {
                         $price = $priceToBasketSpend = $basketItem->getPrice();
@@ -164,6 +192,8 @@ function OnSaleOrderBeforeSavedWantSpend(\Bitrix\Main\Event $event)
                 }
             }
         }
+
+        // Завершаем обработку события
         $event->addResult(
             new \Bitrix\Main\EventResult(
                 \Bitrix\Main\EventResult::SUCCESS, $order
